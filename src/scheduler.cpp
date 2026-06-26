@@ -16,6 +16,8 @@ namespace {
 struct FeasibleOption {
     int machine_index = 0;
     int gpu_used = 0;
+    int memory_waste = 0;
+    double memory_waste_ratio = 0.0;
     double static_cost = 0.0;
 };
 
@@ -125,14 +127,16 @@ void buildFeasible(
                 continue;
             }
 
-            int gpu_waste = max(0, gpu_used * server.gpu_memory - job.gpu_memory);
+            int allocated_memory = gpu_used * server.gpu_memory;
+            int gpu_waste = max(0, allocated_memory - job.gpu_memory);
+            double waste_ratio = gpu_waste / static_cast<double>(max(1, job.gpu_memory));
             double static_cost =
-                0.85 * gpu_waste / max(1, server.gpu_count * server.gpu_memory) +
-                0.70 * gpu_used / static_cast<double>(server.gpu_count) +
-                0.35 * job.cpu_cores / static_cast<double>(server.cpu_cores) +
-                0.25 * job.memory / static_cast<double>(server.memory);
+                2.80 * waste_ratio +
+                0.55 * gpu_used / static_cast<double>(server.gpu_count) +
+                0.25 * job.cpu_cores / static_cast<double>(server.cpu_cores) +
+                0.20 * job.memory / static_cast<double>(server.memory);
 
-            options.push_back(FeasibleOption{index, gpu_used, static_cost});
+            options.push_back(FeasibleOption{index, gpu_used, gpu_waste, waste_ratio, static_cost});
             best_pressure = min(best_pressure, max({
                 gpu_used / static_cast<double>(server.gpu_count),
                 job.cpu_cores / static_cast<double>(server.cpu_cores),
@@ -146,6 +150,10 @@ void buildFeasible(
         }
 
         sort(options.begin(), options.end(), [&](const FeasibleOption &a, const FeasibleOption &b) {
+            if (abs(a.memory_waste_ratio - b.memory_waste_ratio) > 1e-12) {
+                return a.memory_waste_ratio < b.memory_waste_ratio;
+            }
+            if (a.memory_waste != b.memory_waste) return a.memory_waste < b.memory_waste;
             if (abs(a.static_cost - b.static_cost) > 1e-12) return a.static_cost < b.static_cost;
             if (a.gpu_used != b.gpu_used) return a.gpu_used < b.gpu_used;
             return servers[a.machine_index].server_id < servers[b.machine_index].server_id;
@@ -198,6 +206,13 @@ double dynamicJobScore(
                5.8 * scarcity[job.job_id] +
                60.0 / duration;
     }
+    if (mode == "fit") {
+        return 2.2 * scarcity[job.job_id] +
+               3.8 * pressure[job.job_id] +
+               1.5 * job.weight * age +
+               36.0 * job.weight / duration +
+               0.8 * job.weight;
+    }
     return 1.10 * job.weight +
            1.90 * job.weight * age +
            70.0 * job.weight / duration +
@@ -241,6 +256,12 @@ double staticJobScore(
                50.0 / duration +
                0.9 * job.weight;
     }
+    if (mode == "fit") {
+        return 2.8 * scarcity[job.job_id] +
+               3.8 * pressure[job.job_id] +
+               34.0 * job.weight / duration +
+               0.8 * job.weight;
+    }
     return 1.25 * job.weight +
            80.0 * job.weight / duration +
            4.8 * scarcity[job.job_id] +
@@ -268,33 +289,50 @@ pair<int, int> chooseMachine(
         int rem_gpu = machine.rem_gpu - option.gpu_used;
         int rem_cpu = machine.rem_cpu - job.cpu_cores;
         int rem_mem = machine.rem_mem - job.memory;
-        int gpu_waste = max(0, option.gpu_used * server.gpu_memory - job.gpu_memory);
+        int gpu_waste = option.memory_waste;
+        double waste_ratio = option.memory_waste_ratio;
+        double server_waste_ratio =
+            gpu_waste / max(1.0, static_cast<double>(server.gpu_count * server.gpu_memory));
         double cost = 0.0;
 
-        if (mode == "pack") {
-            cost = 1.30 * rem_gpu / static_cast<double>(server.gpu_count) +
-                   0.55 * rem_cpu / static_cast<double>(server.cpu_cores) +
-                   0.40 * rem_mem / static_cast<double>(server.memory) +
-                   1.00 * gpu_waste / max(1.0, static_cast<double>(server.gpu_count * server.gpu_memory)) +
-                   0.20 * option.static_cost;
+        if (mode == "tight") {
+            cost = 4.80 * waste_ratio +
+                   1.10 * option.gpu_used / static_cast<double>(server.gpu_count) +
+                   0.45 * rem_gpu / static_cast<double>(server.gpu_count) +
+                   0.22 * rem_cpu / static_cast<double>(server.cpu_cores) +
+                   0.18 * rem_mem / static_cast<double>(server.memory) +
+                   0.18 * option.static_cost;
+        } else if (mode == "tightpack") {
+            cost = 4.25 * waste_ratio +
+                   1.00 * server_waste_ratio +
+                   1.25 * rem_gpu / static_cast<double>(server.gpu_count) +
+                   0.45 * rem_cpu / static_cast<double>(server.cpu_cores) +
+                   0.35 * rem_mem / static_cast<double>(server.memory) +
+                   0.16 * option.static_cost;
+        } else if (mode == "pack") {
+            cost = 1.05 * rem_gpu / static_cast<double>(server.gpu_count) +
+                   0.45 * rem_cpu / static_cast<double>(server.cpu_cores) +
+                   0.35 * rem_mem / static_cast<double>(server.memory) +
+                   2.60 * waste_ratio +
+                   0.18 * option.static_cost;
         } else if (mode == "spread") {
             cost = -0.75 * rem_gpu / static_cast<double>(server.gpu_count) -
                    0.30 * rem_cpu / static_cast<double>(server.cpu_cores) -
                    0.20 * rem_mem / static_cast<double>(server.memory) +
-                   0.95 * gpu_waste / max(1.0, static_cast<double>(server.gpu_count * server.gpu_memory)) +
-                   0.35 * option.static_cost;
+                   2.20 * waste_ratio +
+                   0.30 * option.static_cost;
         } else if (mode == "balanced2") {
             cost = 0.55 * rem_gpu / static_cast<double>(server.gpu_count) +
                    0.55 * rem_cpu / static_cast<double>(server.cpu_cores) +
                    0.55 * rem_mem / static_cast<double>(server.memory) +
-                   1.25 * gpu_waste / max(1.0, static_cast<double>(server.gpu_count * server.gpu_memory)) +
-                   0.45 * option.static_cost;
+                   2.85 * waste_ratio +
+                   0.36 * option.static_cost;
         } else {
-            cost = 0.80 * rem_gpu / static_cast<double>(server.gpu_count) +
+            cost = 0.65 * rem_gpu / static_cast<double>(server.gpu_count) +
                    0.35 * rem_cpu / static_cast<double>(server.cpu_cores) +
                    0.25 * rem_mem / static_cast<double>(server.memory) +
-                   1.10 * gpu_waste / max(1.0, static_cast<double>(server.gpu_count * server.gpu_memory)) +
-                   0.30 * option.static_cost;
+                   2.95 * waste_ratio +
+                   0.28 * option.static_cost;
         }
 
         if (cost < best_cost - 1e-12 ||
@@ -545,21 +583,29 @@ Metrics evaluateSchedule(
     }
 
     Metrics metrics;
-    double gpu_memory_work = 0.0;
     for (const auto &record : records) {
         const Job &job = *job_by_id[record.job_id];
+        const ServerSpec *server = nullptr;
+        for (const auto &candidate : servers) {
+            if (candidate.server_id == record.server_id) {
+                server = &candidate;
+                break;
+            }
+        }
+        if (server == nullptr) {
+            throw runtime_error("Schedule uses an unknown server id.");
+        }
+
         metrics.weighted_wait += job.weight * static_cast<double>(record.start_time - job.release_time);
-        gpu_memory_work += static_cast<double>(job.gpu_memory) * job.duration;
+        double memory_waste = max(
+            0.0,
+            static_cast<double>(record.gpu_used * server->gpu_memory - job.gpu_memory)
+        );
+        // New judging direction: task-level allocated GPU memory waste.
+        // Duration weighting penalizes long jobs that keep oversized GPUs occupied.
+        metrics.idle_gpu_memory += memory_waste * max(1, job.duration);
         metrics.makespan = max(metrics.makespan, static_cast<double>(record.finish_time));
     }
-
-    int total_gpu_memory = 0;
-    for (const auto &server : servers) {
-        total_gpu_memory += server.gpu_count * server.gpu_memory;
-    }
-    metrics.idle_gpu_memory = metrics.makespan <= 0.0
-        ? total_gpu_memory
-        : total_gpu_memory - gpu_memory_work / metrics.makespan;
     return metrics;
 }
 
@@ -570,10 +616,12 @@ vector<Variant> buildVariants(int job_count, int server_count) {
 
     if (job_count <= 700) {
         variants = {
+            {"fit", "tight", true, 0},
+            {"balanced", "tight", true, 0},
             {"balanced", "balanced", true, 0},
             {"weight", "balanced", true, 0},
-            {"short", "pack", true, 0},
-            {"scarce", "pack", true, 0},
+            {"short", "tightpack", true, 0},
+            {"scarce", "tight", true, 0},
             {"balanced", "pack", true, 0},
             {"dense", "balanced2", true, 0},
             {"fifo", "balanced", true, 0},
@@ -581,19 +629,23 @@ vector<Variant> buildVariants(int job_count, int server_count) {
         };
     } else if (job_count <= 2200) {
         variants = {
+            {"fit", "tight", true, 0},
             {"balanced", "balanced", true, 0},
             {"weight", "balanced", true, 0},
-            {"short", "pack", true, 0},
-            {"scarce", "pack", false, broad_limit},
+            {"short", "tightpack", true, 0},
+            {"scarce", "tight", false, broad_limit},
+            {"fit", "tightpack", false, broad_limit},
             {"dense", "balanced2", false, broad_limit},
             {"balanced", "spread", false, broad_limit},
         };
     } else {
         variants = {
+            {"fit", "tight", false, broad_limit},
             {"balanced", "balanced", false, broad_limit},
             {"weight", "balanced", false, broad_limit},
-            {"short", "pack", false, broad_limit},
-            {"scarce", "pack", false, narrow_limit},
+            {"short", "tightpack", false, broad_limit},
+            {"scarce", "tight", false, narrow_limit},
+            {"fit", "tightpack", false, narrow_limit},
             {"dense", "balanced2", false, narrow_limit},
             {"balanced", "spread", false, narrow_limit},
         };
@@ -636,8 +688,10 @@ vector<ScheduleRecord> selectBestSchedule(
         double idle_norm = max_idle == min_idle ? 0.0 : (metric.idle_gpu_memory - min_idle) / (max_idle - min_idle);
         double finish_norm = max_finish == min_finish ? 0.0 : (metric.makespan - min_finish) / (max_finish - min_finish);
 
-        double score = 0.44 * wait_norm + 0.20 * idle_norm + 0.36 * finish_norm;
-        if (score < best_score) {
+        double score = 0.34 * wait_norm + 0.44 * idle_norm + 0.22 * finish_norm;
+        if (score < best_score - 1e-12 ||
+            (abs(score - best_score) <= 1e-12 &&
+             metrics[i].idle_gpu_memory < metrics[best_index].idle_gpu_memory)) {
             best_score = score;
             best_index = i;
         }
