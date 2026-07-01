@@ -56,6 +56,13 @@ struct Metrics {
     double makespan = 0.0;
 };
 
+struct DemandProfile {
+    double gpu_memory_q25 = 1.0;
+    double gpu_memory_q50 = 1.0;
+    double cpu_q25 = 1.0;
+    double memory_q25 = 1.0;
+};
+
 bool serverById(const ServerSpec &a, const ServerSpec &b) {
     return a.server_id < b.server_id;
 }
@@ -102,17 +109,59 @@ void releaseJob(MachineRuntime &machine, const RunningEvent &event) {
     machine.rem_mem += event.mem_used;
 }
 
+double percentile(vector<int> values, double q) {
+    if (values.empty()) {
+        return 1.0;
+    }
+    sort(values.begin(), values.end());
+    double pos = q * static_cast<double>(values.size() - 1);
+    int lo = static_cast<int>(floor(pos));
+    int hi = static_cast<int>(ceil(pos));
+    if (lo == hi) {
+        return values[lo];
+    }
+    double frac = pos - lo;
+    return values[lo] * (1.0 - frac) + values[hi] * frac;
+}
+
+DemandProfile buildDemandProfile(const vector<Job> &jobs) {
+    vector<int> gpu_memory_values;
+    vector<int> cpu_values;
+    vector<int> memory_values;
+    gpu_memory_values.reserve(jobs.size());
+    cpu_values.reserve(jobs.size());
+    memory_values.reserve(jobs.size());
+
+    for (const auto &job : jobs) {
+        gpu_memory_values.push_back(max(1, job.gpu_memory));
+        cpu_values.push_back(max(1, job.cpu_cores));
+        memory_values.push_back(max(1, job.memory));
+    }
+
+    return DemandProfile{
+        percentile(gpu_memory_values, 0.25),
+        percentile(gpu_memory_values, 0.50),
+        percentile(cpu_values, 0.25),
+        percentile(memory_values, 0.25),
+    };
+}
+
 void buildFeasible(
     const vector<ServerSpec> &servers,
     const vector<Job> &jobs,
     vector<vector<FeasibleOption>> &feasible,
     vector<double> &scarcity,
-    vector<double> &pressure
+    vector<double> &pressure,
+    vector<double> &tight_scarcity,
+    vector<double> &memory_risk,
+    bool compute_memory_risk
 ) {
     int job_count = static_cast<int>(jobs.size());
     feasible.assign(job_count + 1, {});
     scarcity.assign(job_count + 1, 0.0);
     pressure.assign(job_count + 1, 0.0);
+    tight_scarcity.assign(job_count + 1, 0.0);
+    memory_risk.assign(job_count + 1, 0.0);
 
     for (const auto &job : jobs) {
         vector<FeasibleOption> options;
@@ -162,6 +211,28 @@ void buildFeasible(
         feasible[job.job_id] = options;
         scarcity[job.job_id] = 1.0 / max(1, static_cast<int>(options.size()));
         pressure[job.job_id] = best_pressure;
+
+        if (compute_memory_risk) {
+            const double best_ratio = options.front().memory_waste_ratio;
+            const int best_waste = options.front().memory_waste;
+            const double waste_slack_ratio = 0.08;
+            const int waste_slack_abs = max(16, job.gpu_memory / 20);
+            int tight_count = 0;
+            for (const auto &option : options) {
+                if (option.memory_waste <= best_waste + waste_slack_abs ||
+                    option.memory_waste_ratio <= best_ratio + waste_slack_ratio) {
+                    ++tight_count;
+                }
+            }
+            const double median_ratio = options[options.size() / 2].memory_waste_ratio;
+            tight_scarcity[job.job_id] = 1.0 / max(1, tight_count);
+            memory_risk[job.job_id] = min(
+                6.0,
+                max(0.0, median_ratio - best_ratio) +
+                0.80 * tight_scarcity[job.job_id] +
+                0.18 * best_ratio
+            );
+        }
     }
 }
 
@@ -170,6 +241,8 @@ double dynamicJobScore(
     long long now,
     const vector<double> &scarcity,
     const vector<double> &pressure,
+    const vector<double> &tight_scarcity,
+    const vector<double> &memory_risk,
     const string &mode
 ) {
     double wait = max(0LL, now - static_cast<long long>(job.release_time));
@@ -213,6 +286,34 @@ double dynamicJobScore(
                36.0 * job.weight / duration +
                0.8 * job.weight;
     }
+    if (mode == "smith") {
+        return 120.0 * job.weight / duration +
+               2.6 * job.weight * age +
+               1.1 * job.weight +
+               1.8 * scarcity[job.job_id];
+    }
+    if (mode == "lpt") {
+        return 0.020 * duration * (1.0 + pressure[job.job_id]) +
+               1.6 * job.weight * age +
+               2.2 * scarcity[job.job_id] +
+               0.6 * job.weight;
+    }
+    if (mode == "memrisk") {
+        double duration_boost = min(3.0, duration / 900.0);
+        return 9.0 * tight_scarcity[job.job_id] +
+               4.6 * memory_risk[job.job_id] * (1.0 + duration_boost) +
+               2.2 * pressure[job.job_id] +
+               1.3 * job.weight * age +
+               26.0 * job.weight / duration +
+               0.45 * job.weight;
+    }
+    if (mode == "longmem") {
+        return 0.0060 * duration * (1.0 + memory_risk[job.job_id]) +
+               7.2 * tight_scarcity[job.job_id] +
+               3.0 * pressure[job.job_id] +
+               1.2 * job.weight * age +
+               0.55 * job.weight;
+    }
     return 1.10 * job.weight +
            1.90 * job.weight * age +
            70.0 * job.weight / duration +
@@ -225,6 +326,8 @@ double staticJobScore(
     const Job &job,
     const vector<double> &scarcity,
     const vector<double> &pressure,
+    const vector<double> &tight_scarcity,
+    const vector<double> &memory_risk,
     const string &mode
 ) {
     double duration = max(1, job.duration);
@@ -262,6 +365,30 @@ double staticJobScore(
                34.0 * job.weight / duration +
                0.8 * job.weight;
     }
+    if (mode == "smith") {
+        return 120.0 * job.weight / duration +
+               1.1 * job.weight +
+               1.8 * scarcity[job.job_id];
+    }
+    if (mode == "lpt") {
+        return 0.020 * duration * (1.0 + pressure[job.job_id]) +
+               2.2 * scarcity[job.job_id] +
+               0.6 * job.weight;
+    }
+    if (mode == "memrisk") {
+        double duration_boost = min(3.0, duration / 900.0);
+        return 9.0 * tight_scarcity[job.job_id] +
+               4.8 * memory_risk[job.job_id] * (1.0 + duration_boost) +
+               2.5 * pressure[job.job_id] +
+               24.0 * job.weight / duration +
+               0.45 * job.weight;
+    }
+    if (mode == "longmem") {
+        return 0.0060 * duration * (1.0 + memory_risk[job.job_id]) +
+               7.2 * tight_scarcity[job.job_id] +
+               3.0 * pressure[job.job_id] +
+               0.55 * job.weight;
+    }
     return 1.25 * job.weight +
            80.0 * job.weight / duration +
            4.8 * scarcity[job.job_id] +
@@ -269,20 +396,90 @@ double staticJobScore(
            45.0 / duration;
 }
 
+double residualFragmentCost(
+    const ServerSpec &server,
+    int rem_gpu,
+    int rem_cpu,
+    int rem_mem,
+    const DemandProfile &profile
+) {
+    if (rem_gpu <= 0) {
+        return -0.22;
+    }
+
+    double free_gpu_memory = static_cast<double>(rem_gpu) * server.gpu_memory;
+    double gpu_need_q25 = max(1.0, profile.gpu_memory_q25);
+    double gpu_need_q50 = max(1.0, profile.gpu_memory_q50);
+    double cpu_need_q25 = min(max(1.0, profile.cpu_q25), static_cast<double>(server.cpu_cores));
+    double mem_need_q25 = min(max(1.0, profile.memory_q25), static_cast<double>(server.memory));
+
+    double cost = 0.0;
+    if (free_gpu_memory < gpu_need_q25) {
+        cost += (gpu_need_q25 - free_gpu_memory) / gpu_need_q25;
+    } else if (free_gpu_memory >= gpu_need_q50 &&
+               rem_cpu >= cpu_need_q25 &&
+               rem_mem >= mem_need_q25) {
+        cost -= 0.18;
+    }
+
+    if (rem_cpu < cpu_need_q25) {
+        cost += 0.65 * (cpu_need_q25 - rem_cpu) / max(1.0, static_cast<double>(server.cpu_cores));
+    }
+    if (rem_mem < mem_need_q25) {
+        cost += 0.65 * (mem_need_q25 - rem_mem) / max(1.0, static_cast<double>(server.memory));
+    }
+
+    double rem_gpu_frac = rem_gpu / static_cast<double>(server.gpu_count);
+    double rem_cpu_frac = rem_cpu / static_cast<double>(server.cpu_cores);
+    double rem_mem_frac = rem_mem / static_cast<double>(server.memory);
+    double imbalance = max({
+        abs(rem_gpu_frac - rem_cpu_frac),
+        abs(rem_gpu_frac - rem_mem_frac),
+        abs(rem_cpu_frac - rem_mem_frac),
+    });
+    return cost + 0.22 * imbalance;
+}
+
 pair<int, int> chooseMachine(
     const Job &job,
     vector<MachineRuntime> &machines,
     const vector<vector<FeasibleOption>> &feasible,
+    const DemandProfile &profile,
     const string &mode
 ) {
     double best_cost = numeric_limits<double>::infinity();
     int best_machine = -1;
     int best_gpu = 0;
+    const auto &options = feasible[job.job_id];
+    int preferred_limit = static_cast<int>(options.size());
+    bool bestwaste_mode = (mode == "bestwaste");
+    bool strict_best_waste = bestwaste_mode && job.weight <= 2;
+    bool use_fragment_cost = (mode == "fgd" || mode == "memtight" || mode == "fragpack" || bestwaste_mode);
+    int scan_limit = use_fragment_cost ? 48 : 32;
+    if (strict_best_waste) {
+        const int best_waste = options.front().memory_waste;
+        const double best_ratio = options.front().memory_waste_ratio;
+        const int waste_slack_abs = max(16, job.gpu_memory / 20);
+        const double waste_slack_ratio = 0.08;
+        preferred_limit = 0;
+        while (preferred_limit < static_cast<int>(options.size())) {
+            const auto &option = options[preferred_limit];
+            if (option.memory_waste > best_waste + waste_slack_abs &&
+                option.memory_waste_ratio > best_ratio + waste_slack_ratio) {
+                break;
+            }
+            ++preferred_limit;
+        }
+        preferred_limit = max(1, min(preferred_limit, 64));
+    }
+    if (preferred_limit > scan_limit) {
+        preferred_limit = scan_limit;
+    }
 
-    for (const auto &option : feasible[job.job_id]) {
+    auto considerOption = [&](const FeasibleOption &option) {
         MachineRuntime &machine = machines[option.machine_index];
         if (!canStart(machine, job, option.gpu_used)) {
-            continue;
+            return;
         }
 
         const ServerSpec &server = machine.spec;
@@ -293,6 +490,10 @@ pair<int, int> chooseMachine(
         double waste_ratio = option.memory_waste_ratio;
         double server_waste_ratio =
             gpu_waste / max(1.0, static_cast<double>(server.gpu_count * server.gpu_memory));
+        double fragment_cost = 0.0;
+        if (use_fragment_cost) {
+            fragment_cost = residualFragmentCost(server, rem_gpu, rem_cpu, rem_mem, profile);
+        }
         double cost = 0.0;
 
         if (mode == "tight") {
@@ -315,6 +516,48 @@ pair<int, int> chooseMachine(
                    0.35 * rem_mem / static_cast<double>(server.memory) +
                    2.60 * waste_ratio +
                    0.18 * option.static_cost;
+        } else if (mode == "tetris") {
+            double free_gpu = machine.rem_gpu / static_cast<double>(server.gpu_count);
+            double free_cpu = machine.rem_cpu / static_cast<double>(server.cpu_cores);
+            double free_mem = machine.rem_mem / static_cast<double>(server.memory);
+            double demand_gpu = option.gpu_used / static_cast<double>(server.gpu_count);
+            double demand_cpu = job.cpu_cores / static_cast<double>(server.cpu_cores);
+            double demand_mem = job.memory / static_cast<double>(server.memory);
+            double match_score = free_gpu * demand_gpu + free_cpu * demand_cpu + free_mem * demand_mem;
+            double residual_imbalance = max({abs(rem_gpu / static_cast<double>(server.gpu_count) -
+                                                 rem_cpu / static_cast<double>(server.cpu_cores)),
+                                             abs(rem_gpu / static_cast<double>(server.gpu_count) -
+                                                 rem_mem / static_cast<double>(server.memory)),
+                                             abs(rem_cpu / static_cast<double>(server.cpu_cores) -
+                                                 rem_mem / static_cast<double>(server.memory))});
+            cost = -0.95 * match_score +
+                   0.55 * residual_imbalance +
+                   2.70 * waste_ratio +
+                   0.20 * option.static_cost;
+        } else if (mode == "fgd") {
+            cost = 5.20 * waste_ratio +
+                   1.20 * server_waste_ratio +
+                   1.35 * fragment_cost +
+                   0.45 * option.gpu_used / static_cast<double>(server.gpu_count) +
+                   0.12 * rem_gpu / static_cast<double>(server.gpu_count) +
+                   0.14 * option.static_cost;
+        } else if (mode == "memtight") {
+            cost = 7.20 * waste_ratio +
+                   1.80 * server_waste_ratio +
+                   0.82 * fragment_cost +
+                   0.42 * option.gpu_used / static_cast<double>(server.gpu_count) +
+                   0.08 * option.static_cost;
+        } else if (mode == "fragpack") {
+            cost = 3.65 * waste_ratio +
+                   1.70 * fragment_cost +
+                   0.75 * rem_gpu / static_cast<double>(server.gpu_count) +
+                   0.28 * rem_cpu / static_cast<double>(server.cpu_cores) +
+                   0.22 * rem_mem / static_cast<double>(server.memory) +
+                   0.18 * option.static_cost;
+        } else if (mode == "bestwaste") {
+            cost = static_cast<double>(option.memory_waste) * max(1, job.duration) +
+                   0.055 * max(1, job.duration) * option.gpu_used / static_cast<double>(server.gpu_count) +
+                   0.025 * max(1, job.duration) * max(0.0, fragment_cost);
         } else if (mode == "spread") {
             cost = -0.75 * rem_gpu / static_cast<double>(server.gpu_count) -
                    0.30 * rem_cpu / static_cast<double>(server.cpu_cores) -
@@ -341,6 +584,17 @@ pair<int, int> chooseMachine(
             best_machine = option.machine_index;
             best_gpu = option.gpu_used;
         }
+    };
+
+    for (int i = 0; i < preferred_limit; ++i) {
+        considerOption(options[i]);
+    }
+    if (best_machine < 0) {
+        if (!strict_best_waste) {
+            for (int i = preferred_limit; i < static_cast<int>(options.size()); ++i) {
+                considerOption(options[i]);
+            }
+        }
     }
 
     return {best_machine, best_gpu};
@@ -352,6 +606,9 @@ vector<ScheduleRecord> runDynamicSchedule(
     const vector<vector<FeasibleOption>> &feasible,
     const vector<double> &scarcity,
     const vector<double> &pressure,
+    const vector<double> &tight_scarcity,
+    const vector<double> &memory_risk,
+    const DemandProfile &profile,
     const Variant &variant
 ) {
     vector<MachineRuntime> machines = makeMachines(servers);
@@ -381,8 +638,8 @@ vector<ScheduleRecord> runDynamicSchedule(
 
         if (!pending.empty()) {
             sort(pending.begin(), pending.end(), [&](const Job &a, const Job &b) {
-                double sa = dynamicJobScore(a, now, scarcity, pressure, variant.priority_mode);
-                double sb = dynamicJobScore(b, now, scarcity, pressure, variant.priority_mode);
+                double sa = dynamicJobScore(a, now, scarcity, pressure, tight_scarcity, memory_risk, variant.priority_mode);
+                double sb = dynamicJobScore(b, now, scarcity, pressure, tight_scarcity, memory_risk, variant.priority_mode);
                 if (abs(sa - sb) > 1e-12) return sa > sb;
                 return a.job_id < b.job_id;
             });
@@ -390,7 +647,7 @@ vector<ScheduleRecord> runDynamicSchedule(
             vector<Job> still_pending;
             still_pending.reserve(pending.size());
             for (const auto &job : pending) {
-                auto choice = chooseMachine(job, machines, feasible, variant.machine_mode);
+                auto choice = chooseMachine(job, machines, feasible, profile, variant.machine_mode);
                 if (choice.first < 0) {
                     still_pending.push_back(job);
                     continue;
@@ -454,6 +711,9 @@ vector<ScheduleRecord> runHeapSchedule(
     const vector<vector<FeasibleOption>> &feasible,
     const vector<double> &scarcity,
     const vector<double> &pressure,
+    const vector<double> &tight_scarcity,
+    const vector<double> &memory_risk,
+    const DemandProfile &profile,
     const Variant &variant
 ) {
     struct ReadyEntry {
@@ -490,7 +750,7 @@ vector<ScheduleRecord> runHeapSchedule(
 
         while (next_job < static_cast<int>(by_release.size()) && by_release[next_job].release_time <= now) {
             const Job &job = by_release[next_job];
-            double score = staticJobScore(job, scarcity, pressure, variant.priority_mode);
+            double score = staticJobScore(job, scarcity, pressure, tight_scarcity, memory_risk, variant.priority_mode);
             ready.push(ReadyEntry{-score, job.job_id, job});
             ++next_job;
         }
@@ -512,7 +772,7 @@ vector<ScheduleRecord> runHeapSchedule(
                 ready.pop();
                 const Job &job = entry.job;
 
-                auto choice = chooseMachine(job, machines, feasible, variant.machine_mode);
+                auto choice = chooseMachine(job, machines, feasible, profile, variant.machine_mode);
                 if (choice.first < 0) {
                     blocked.push_back(entry);
                     continue;
@@ -609,6 +869,138 @@ Metrics evaluateSchedule(
     return metrics;
 }
 
+vector<ScheduleRecord> repackFixedStarts(
+    const vector<ServerSpec> &servers,
+    const vector<Job> &jobs,
+    const vector<vector<FeasibleOption>> &feasible,
+    const DemandProfile &profile,
+    const vector<ScheduleRecord> &records
+) {
+    vector<const Job *> job_by_id(jobs.size() + 1, nullptr);
+    for (const auto &job : jobs) {
+        job_by_id[job.job_id] = &job;
+    }
+
+    vector<ScheduleRecord> record_by_id(jobs.size() + 1);
+    vector<int> order;
+    order.reserve(records.size());
+    for (const auto &record : records) {
+        record_by_id[record.job_id] = record;
+        order.push_back(record.job_id);
+    }
+
+    int max_server_id = 0;
+    for (const auto &server : servers) {
+        max_server_id = max(max_server_id, server.server_id);
+    }
+    vector<int> server_index_by_id(max_server_id + 1, -1);
+    for (int i = 0; i < static_cast<int>(servers.size()); ++i) {
+        server_index_by_id[servers[i].server_id] = i;
+    }
+
+    auto originalWaste = [&](int job_id) {
+        const Job &job = *job_by_id[job_id];
+        const ScheduleRecord &record = record_by_id[job_id];
+        int server_index = server_index_by_id[record.server_id];
+        if (server_index < 0) {
+            return 0.0;
+        }
+        const ServerSpec &server = servers[server_index];
+        return static_cast<double>(max(0, record.gpu_used * server.gpu_memory - job.gpu_memory)) *
+               max(1, job.duration);
+    };
+
+    sort(order.begin(), order.end(), [&](int a, int b) {
+        const ScheduleRecord &ra = record_by_id[a];
+        const ScheduleRecord &rb = record_by_id[b];
+        if (ra.start_time != rb.start_time) return ra.start_time < rb.start_time;
+        double wa = originalWaste(a);
+        double wb = originalWaste(b);
+        if (abs(wa - wb) > 1e-12) return wa > wb;
+        if (feasible[a].size() != feasible[b].size()) return feasible[a].size() < feasible[b].size();
+        return a < b;
+    });
+
+    vector<MachineRuntime> machines = makeMachines(servers);
+    priority_queue<RunningEvent, vector<RunningEvent>, greater<RunningEvent>> running;
+    vector<ScheduleRecord> repaired(jobs.size() + 1);
+
+    for (int job_id : order) {
+        const Job &job = *job_by_id[job_id];
+        const ScheduleRecord &old_record = record_by_id[job_id];
+        long long now = old_record.start_time;
+
+        while (!running.empty() && running.top().finish_time <= now) {
+            RunningEvent event = running.top();
+            running.pop();
+            releaseJob(machines[event.machine_index], event);
+        }
+
+        double best_cost = numeric_limits<double>::infinity();
+        int best_machine = -1;
+        int best_gpu = 0;
+        for (const auto &option : feasible[job.job_id]) {
+            MachineRuntime &machine = machines[option.machine_index];
+            if (!canStart(machine, job, option.gpu_used)) {
+                continue;
+            }
+
+            const ServerSpec &server = machine.spec;
+            int rem_gpu = machine.rem_gpu - option.gpu_used;
+            int rem_cpu = machine.rem_cpu - job.cpu_cores;
+            int rem_mem = machine.rem_mem - job.memory;
+            double duration = max(1, job.duration);
+            double memory_cost = static_cast<double>(option.memory_waste) * duration;
+            double fragment_cost = residualFragmentCost(server, rem_gpu, rem_cpu, rem_mem, profile);
+            double cost = memory_cost +
+                          0.035 * duration * option.gpu_used / static_cast<double>(server.gpu_count) +
+                          0.020 * duration * max(0.0, fragment_cost);
+
+            if (cost < best_cost - 1e-12 ||
+                (abs(cost - best_cost) <= 1e-12 && server.server_id < machines[best_machine].spec.server_id)) {
+                best_cost = cost;
+                best_machine = option.machine_index;
+                best_gpu = option.gpu_used;
+            }
+        }
+
+        if (best_machine < 0) {
+            return records;
+        }
+
+        MachineRuntime &machine = machines[best_machine];
+        startJob(machine, job, best_gpu);
+        repaired[job.job_id] = ScheduleRecord{
+            job.job_id,
+            machine.spec.server_id,
+            old_record.start_time,
+            best_gpu,
+            old_record.finish_time,
+        };
+        running.push(RunningEvent{
+            old_record.finish_time,
+            best_machine,
+            best_gpu,
+            job.cpu_cores,
+            job.memory,
+            job.job_id,
+        });
+    }
+
+    vector<ScheduleRecord> result;
+    result.reserve(jobs.size());
+    for (const auto &job : jobs) {
+        result.push_back(repaired[job.job_id]);
+    }
+
+    Metrics before = evaluateSchedule(servers, jobs, records);
+    Metrics after = evaluateSchedule(servers, jobs, result);
+    if (after.idle_gpu_memory <= before.idle_gpu_memory) {
+        return result;
+    }
+    return records;
+}
+
 vector<Variant> buildVariants(int job_count, int server_count) {
     vector<Variant> variants;
     int broad_limit = max(900, server_count * 14);
@@ -617,35 +1009,55 @@ vector<Variant> buildVariants(int job_count, int server_count) {
     if (job_count <= 700) {
         variants = {
             {"fit", "tight", true, 0},
+            {"memrisk", "fgd", true, 0},
+            {"longmem", "memtight", true, 0},
+            {"memrisk", "bestwaste", false, broad_limit},
             {"balanced", "tight", true, 0},
+            {"smith", "tight", true, 0},
+            {"lpt", "tetris", true, 0},
             {"balanced", "balanced", true, 0},
             {"weight", "balanced", true, 0},
             {"short", "tightpack", true, 0},
             {"scarce", "tight", true, 0},
+            {"fit", "fragpack", true, 0},
             {"balanced", "pack", true, 0},
             {"dense", "balanced2", true, 0},
             {"fifo", "balanced", true, 0},
             {"balanced", "spread", true, 0},
         };
-    } else if (job_count <= 2200) {
+    } else if (job_count <= 1200) {
         variants = {
             {"fit", "tight", true, 0},
+            {"smith", "tight", true, 0},
             {"balanced", "balanced", true, 0},
-            {"weight", "balanced", true, 0},
             {"short", "tightpack", true, 0},
             {"scarce", "tight", false, broad_limit},
             {"fit", "tightpack", false, broad_limit},
+            {"lpt", "tetris", false, narrow_limit},
             {"dense", "balanced2", false, broad_limit},
             {"balanced", "spread", false, broad_limit},
         };
-    } else {
+    } else if (job_count <= 2200) {
         variants = {
+            {"fit", "tight", true, 0},
+            {"smith", "tight", false, broad_limit},
             {"fit", "tight", false, broad_limit},
             {"balanced", "balanced", false, broad_limit},
             {"weight", "balanced", false, broad_limit},
             {"short", "tightpack", false, broad_limit},
             {"scarce", "tight", false, narrow_limit},
+            {"dense", "balanced2", false, narrow_limit},
+        };
+    } else {
+        variants = {
+            {"fit", "tight", false, broad_limit},
+            {"smith", "tight", false, broad_limit},
+            {"balanced", "balanced", false, broad_limit},
+            {"weight", "balanced", false, broad_limit},
+            {"short", "tightpack", false, broad_limit},
+            {"scarce", "tight", false, narrow_limit},
             {"fit", "tightpack", false, narrow_limit},
+            {"lpt", "tetris", false, narrow_limit},
             {"dense", "balanced2", false, narrow_limit},
             {"balanced", "spread", false, narrow_limit},
         };
@@ -680,18 +1092,23 @@ vector<ScheduleRecord> selectBestSchedule(
         max_finish = max(max_finish, metric.makespan);
     }
 
-    int best_index = 0;
-    double best_score = numeric_limits<double>::infinity();
-    for (int i = 0; i < static_cast<int>(metrics.size()); ++i) {
-        const Metrics &metric = metrics[i];
+    auto combinedScore = [&](const Metrics &metric) {
         double wait_norm = max_wait == min_wait ? 0.0 : (metric.weighted_wait - min_wait) / (max_wait - min_wait);
         double idle_norm = max_idle == min_idle ? 0.0 : (metric.idle_gpu_memory - min_idle) / (max_idle - min_idle);
         double finish_norm = max_finish == min_finish ? 0.0 : (metric.makespan - min_finish) / (max_finish - min_finish);
+        return 0.25 * wait_norm + 0.60 * idle_norm + 0.15 * finish_norm;
+    };
 
-        double score = 0.34 * wait_norm + 0.44 * idle_norm + 0.22 * finish_norm;
+    int best_index = 0;
+    double best_score = combinedScore(metrics[0]);
+    for (int i = 0; i < static_cast<int>(metrics.size()); ++i) {
+        const Metrics &metric = metrics[i];
+        double score = combinedScore(metric);
         if (score < best_score - 1e-12 ||
             (abs(score - best_score) <= 1e-12 &&
-             metrics[i].idle_gpu_memory < metrics[best_index].idle_gpu_memory)) {
+             (metric.idle_gpu_memory < metrics[best_index].idle_gpu_memory ||
+              (metric.idle_gpu_memory == metrics[best_index].idle_gpu_memory &&
+               metric.weighted_wait < metrics[best_index].weighted_wait)))) {
             best_score = score;
             best_index = i;
         }
@@ -715,7 +1132,13 @@ vector<ScheduleRecord> GreedyScheduler::schedule() {
     vector<vector<FeasibleOption>> feasible;
     vector<double> scarcity;
     vector<double> pressure;
-    buildFeasible(servers, jobs, feasible, scarcity, pressure);
+    vector<double> tight_scarcity;
+    vector<double> memory_risk;
+    bool use_memory_variants = jobs.size() <= 700;
+    DemandProfile profile = buildDemandProfile(jobs);
+    buildFeasible(
+        servers, jobs, feasible, scarcity, pressure, tight_scarcity, memory_risk, use_memory_variants
+    );
 
     vector<Variant> variants = buildVariants(static_cast<int>(jobs.size()), static_cast<int>(servers.size()));
     vector<vector<ScheduleRecord>> schedules;
@@ -723,12 +1146,20 @@ vector<ScheduleRecord> GreedyScheduler::schedule() {
 
     for (const auto &variant : variants) {
         if (variant.dynamic_priority) {
-            schedules.push_back(runDynamicSchedule(servers, jobs, feasible, scarcity, pressure, variant));
+            schedules.push_back(runDynamicSchedule(
+                servers, jobs, feasible, scarcity, pressure, tight_scarcity, memory_risk, profile, variant
+            ));
         } else {
-            schedules.push_back(runHeapSchedule(servers, jobs, feasible, scarcity, pressure, variant));
+            schedules.push_back(runHeapSchedule(
+                servers, jobs, feasible, scarcity, pressure, tight_scarcity, memory_risk, profile, variant
+            ));
         }
     }
 
-    return selectBestSchedule(servers, jobs, schedules);
+    vector<ScheduleRecord> selected = selectBestSchedule(servers, jobs, schedules);
+    if (jobs.size() > 2200) {
+        return selected;
+    }
+    return repackFixedStarts(servers, jobs, feasible, profile, selected);
 }
 

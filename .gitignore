@@ -1,0 +1,7 @@
+build/*
+!build/.gitkeep
+output_dir/*
+!output_dir/.gitkeep
+*.exe
+*.out
+variant_metrics_cache.json
